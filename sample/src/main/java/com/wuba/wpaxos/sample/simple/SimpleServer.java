@@ -21,13 +21,15 @@ import com.wuba.wpaxos.comm.NodeInfo;
 import com.wuba.wpaxos.comm.Options;
 import com.wuba.wpaxos.comm.enums.IndexType;
 import com.wuba.wpaxos.node.Node;
-import com.wuba.wpaxos.sample.kv.rocksdb.RocksDBHolder;
 import com.wuba.wpaxos.store.config.StoreConfig;
 import com.wuba.wpaxos.storemachine.SMCtx;
 import com.wuba.wpaxos.utils.JavaOriTypeWrapper;
 
 import java.io.File;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public class SimpleServer {
 	private NodeInfo myNode;
@@ -65,6 +67,15 @@ public class SimpleServer {
 		options.setGroupCount(groupCount);
 		options.setMyNode(this.myNode);
 		options.setNodeInfoList(this.nodeList);
+
+		// fill nodeInfoMap for each group: Group.java reads options.getNodeInfoMap().get(groupIdx)
+		// and SystemVSM.addNodeIDList iterates it, so an absent entry is a NullPointerException.
+		Map<Integer, ArrayList<NodeInfo>> nodeInfoMap = new HashMap<>();
+		for (int gid = 0; gid < groupCount; gid++) {
+			nodeInfoMap.put(gid, new ArrayList<>(this.nodeList));
+		}
+		options.setNodeInfoMap(nodeInfoMap);
+
 		options.setUseMembership(true);
 		options.setUseBatchPropose(useBatchPropose);
 		options.setIndexType(indexType);
@@ -79,7 +90,6 @@ public class SimpleServer {
 		}
 		this.paxosNode = Node.runNode(options);
 		this.paxosNode.setHoldPaxosLogCount(500000);
-		RocksDBHolder.init(groupCount, rootPath);
 		for (int gid = 0; gid < this.groupCount; ++gid) {
 			this.paxosNode.setBatchCount(gid, batchCount);
 		}

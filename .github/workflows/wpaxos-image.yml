@@ -1,0 +1,201 @@
+name: wpaxos-image
+
+# Builds the WPaxos benchmark image for both linux/amd64 and linux/arm64 and publishes it to GHCR.
+# The tag is YYYY.MM.DD-<full commit sha>, computed at run time, so an image pulled later is
+# unambiguous about which commit produced it.
+
+on:
+  push:
+    branches:
+      - simbo1905
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/simbo1905/wpaxos
+
+jobs:
+  meta:
+    name: tag and provenance
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.ids.outputs.sha }}
+      tag: ${{ steps.ids.outputs.tag }}
+      created: ${{ steps.ids.outputs.created }}
+    steps:
+      - name: compute tag
+        id: ids
+        run: |
+          set -euo pipefail
+          # YYYY.MM.DD-<full commit sha>, both computed here and never written down literally.
+          # The day is the date the image is built, not the date of the commit: a commit made in
+          # March and built today is a September artifact.
+          day="$(date -u +%Y.%m.%d)"
+          sha="${GITHUB_SHA}"
+          created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "sha=${sha}"      >> "${GITHUB_OUTPUT}"
+          echo "tag=${day}-${sha}" >> "${GITHUB_OUTPUT}"
+          echo "created=${created}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "image=${IMAGE_NAME}"
+            echo "tag=${day}-${sha}"
+            echo "git.revision=${sha}"
+            echo "build.created=${created}"
+            echo "archive.build.created=${day}"
+          } | tee "${GITHUB_STEP_SUMMARY}"
+
+  build:
+    name: build ${{ matrix.platform }}
+    needs: meta
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            qemu: false
+          - platform: linux/arm64
+            arch: arm64
+            qemu: true
+    steps:
+      - uses: actions/checkout@v4
+
+      # The amd64 leg is native on the GitHub-hosted runner. The arm64 leg is built under QEMU
+      # emulation, which is honest but slow: the whole Maven build runs emulated, so expect tens
+      # of minutes rather than a couple. Move this leg to an arm64 runner (for example
+      # ubuntu-24.04-arm) when one is available and set qemu: false; the image build is
+      # architecture-neutral and needs no other change.
+      - uses: docker/setup-qemu-action@v3
+        if: matrix.qemu
+        with:
+          platforms: ${{ matrix.platform }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: resolve base image digests
+        id: base
+        run: |
+          set -euo pipefail
+          for pair in "build:maven:3.9-eclipse-temurin-8" "runtime:eclipse-temurin:8-jre"; do
+            role="${pair%%:*}"; img="${pair#*:}"
+            docker pull --platform "${{ matrix.platform }}" "${img}"
+            digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "${img}" 2>/dev/null | cut -d@ -f2 || true)"
+            [ -n "${digest}" ] || digest=unresolved
+            echo "${role}=${digest}" >> "${GITHUB_OUTPUT}"
+            echo "${role}: ${img}@${digest}"
+          done
+
+      - name: build and push ${{ matrix.platform }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          provenance: true
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ needs.meta.outputs.tag }}-${{ matrix.arch }}
+            ${{ env.IMAGE_NAME }}:latest-${{ matrix.arch }}
+          build-args: |
+            VCS_REF=${{ needs.meta.outputs.sha }}
+            BUILD_CREATED=${{ needs.meta.outputs.created }}
+            SOURCE_URL=${{ github.server_url }}/${{ github.repository }}.git
+            BASE_BUILD_DIGEST=${{ steps.base.outputs.build }}
+            BASE_RUNTIME_DIGEST=${{ steps.base.outputs.runtime }}
+
+  manifest:
+    name: publish manifest list
+    needs: [meta, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: join the two platform images into one manifest list
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            --tag "${IMAGE_NAME}:${{ needs.meta.outputs.tag }}" \
+            "${IMAGE_NAME}:${{ needs.meta.outputs.tag }}-amd64" \
+            "${IMAGE_NAME}:${{ needs.meta.outputs.tag }}-arm64"
+          docker buildx imagetools create \
+            --tag "${IMAGE_NAME}:latest" \
+            "${IMAGE_NAME}:${{ needs.meta.outputs.tag }}-amd64" \
+            "${IMAGE_NAME}:${{ needs.meta.outputs.tag }}-arm64"
+          docker buildx imagetools inspect "${IMAGE_NAME}:${{ needs.meta.outputs.tag }}"
+
+      - name: record what was published
+        run: |
+          set -euo pipefail
+          echo "${IMAGE_NAME}       ${IMAGE_NAME}:${{ needs.meta.outputs.tag }} (manifest list)"  >> "${GITHUB_STEP_SUMMARY}"
+          echo "${IMAGE_NAME}       ${IMAGE_NAME}:latest (manifest list)"                   >> "${GITHUB_STEP_SUMMARY}"
+          echo "${IMAGE_NAME}       ${IMAGE_NAME}:${{ needs.meta.outputs.tag }}-amd64"        >> "${GITHUB_STEP_SUMMARY}"
+          echo "${IMAGE_NAME}       ${IMAGE_NAME}:${{ needs.meta.outputs.tag }}-arm64"        >> "${GITHUB_STEP_SUMMARY}"
+
+      # Provenance is inside the image as well as in its OCI labels. This reads it back out of
+      # the published artifact on both architectures, so the run log carries the sha256sum of
+      # every shipped jar rather than a claim that they were built from this commit.
+      - name: read back PROVENANCE from the published image
+        run: |
+          set -euo pipefail
+          for p in linux/amd64 linux/arm64; do
+            echo "--- ${p}"
+            docker run --rm --platform "${p}" --entrypoint cat \
+              "${IMAGE_NAME}:${{ needs.meta.outputs.tag }}" /opt/wpaxos/PROVENANCE
+            docker run --rm --platform "${p}" --entrypoint cat \
+              "${IMAGE_NAME}:${{ needs.meta.outputs.tag }}" /opt/wpaxos/conf/log4j.properties > /dev/null
+          done
+
+      # GHCR container packages are private by default. A private package means the VPS must
+      # present a token to pull; there is no anonymous pull. The visibility is reported here so
+      # the run log says which of the two cases you are in. This step never fails the workflow:
+      # publishing succeeded regardless of what the API will tell us.
+      - name: report package visibility
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          owner="${{ github.repository_owner }}"
+          vis=""
+          for base in "https://api.github.com/orgs/${owner}" "https://api.github.com/users/${owner}"; do
+            body="$(curl -sS -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                    "${base}/packages/container/wpaxos" || true)"
+            vis="$(printf '%s' "${body}" | jq -r '.visibility // empty' 2>/dev/null || true)"
+            if [ -n "${vis}" ]; then break; fi
+            echo "no visibility from ${base}: ${body}"
+          done
+          {
+            echo "### package visibility"
+            if [ "${vis}" = "public" ]; then
+              echo "public - the VPS can pull anonymously with \`docker pull ${IMAGE_NAME}:latest\`"
+            elif [ -n "${vis}" ]; then
+              echo "${vis} - a private package cannot be pulled anonymously. Either set the"
+              echo "package to public (Settings -> Packages -> wpaxos -> Change visibility), or"
+              echo "give the VPS a read:packages PAT and log in with \`docker login ghcr.io\`."
+            else
+              echo "unresolved - the API did not report a visibility for this token:"
+              echo "${body}"
+            fi
+          } | tee "${GITHUB_STEP_SUMMARY}"

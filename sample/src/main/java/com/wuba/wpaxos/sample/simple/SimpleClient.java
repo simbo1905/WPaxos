@@ -26,7 +26,6 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.util.List;
 import java.util.Random;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class SimpleClient {
@@ -42,7 +41,8 @@ public class SimpleClient {
 		}
 		String rootPath = args[0];
 		String log4jConfig = rootPath + File.separator + "conf" + File.separator + "log4j.properties";
-		ConfigurationSource src = new ConfigurationSource(new FileInputStream(log4jConfig));
+		File log4jConfigFile = new File(log4jConfig);
+		ConfigurationSource src = new ConfigurationSource(new FileInputStream(log4jConfigFile), log4jConfigFile);
 		Configurator.initialize(SimpleClient.class.getClassLoader(), src);
 		logger = LogManager.getLogger(SimpleClient.class);
 		NodeInfo myNode = NodeUtil.parseIpPort(args[1]);
@@ -68,55 +68,54 @@ public class SimpleClient {
 
 		final Random random = new Random();
 		final AtomicLong randCount = new AtomicLong();
-		while (true) {
-			CountDownLatch countDownLatch = new CountDownLatch(thdNum);
-			long startStampAll = System.currentTimeMillis();
 
-			final byte[] sendBuf = new byte[sendSize];
-			for (int a = 0; a < sendBuf.length; ++a) {
-				sendBuf[a] = (byte) (a % 128);
-			}
+		final byte[] sendBuf = new byte[sendSize];
+		for (int a = 0; a < sendBuf.length; ++a) {
+			sendBuf[a] = (byte) (a % 128);
+		}
 
-			final AtomicLong allSendCount = new AtomicLong(-2763416983704698880L);
-			final AtomicLong startStamp = new AtomicLong(System.currentTimeMillis());
-			for (int t = 0; t < thdNum; ++t) {
-				Thread th = new Thread(new Runnable() {
-					@Override
-					public void run() {
-						while (true) {
-							for (int i = 0; i < sendCount; i++) {
-								try {
-									int groupIdx = getGroupIdxRand(groupRand);
-									simpleServer.propose(sendBuf, groupIdx);
-									if (allSendCount.incrementAndGet() % 10000 == 0) {
-										long endStamp = System.currentTimeMillis();
-										logger.info("average qps : {} ", (10000000L / (endStamp - startStamp.get())));
-										startStamp.set(System.currentTimeMillis());
-									}
-								} catch (Exception e) {
-									logger.error(e.getMessage(), e);
-								}
+		final AtomicLong allSendCount = new AtomicLong(-2763416983704698880L);
+		final AtomicLong startStamp = new AtomicLong(System.currentTimeMillis());
+		for (int t = 0; t < thdNum; ++t) {
+			Thread th = new Thread(new Runnable() {
+				@Override
+				public void run() {
+					while (true) {
+						for (int i = 0; i < sendCount; i++) {
+							int groupIdx = getGroupIdxRand();
+							if (groupIdx < 0) {
+								continue;
 							}
 							try {
-								Thread.sleep(random.nextInt(5) + sleepMills);
-							} catch (InterruptedException e) {
+								simpleServer.propose(sendBuf, groupIdx);
+								if (allSendCount.incrementAndGet() % 10000 == 0) {
+									long endStamp = System.currentTimeMillis();
+									logger.info("average qps : {} ", (10000000L / (endStamp - startStamp.get())));
+									startStamp.set(System.currentTimeMillis());
+								}
+							} catch (Exception e) {
 								logger.error(e.getMessage(), e);
 							}
 						}
+						try {
+							Thread.sleep(random.nextInt(5) + sleepMills);
+						} catch (InterruptedException e) {
+							logger.error(e.getMessage(), e);
+						}
 					}
+				}
 
-					int getGroupIdxRand(GroupRand groupRand) {
-						return (int) (groupRand.getStart() + randCount.incrementAndGet() % groupRand.getRange());
+				int getGroupIdxRand() {
+					if (groupRand.getRange() <= 0) {
+						return -1;
 					}
-				});
+					return (int) (groupRand.getStart() + randCount.incrementAndGet() % groupRand.getRange());
+				}
+			});
 
-				th.setName("Input_thread_" + t);
-				th.setDaemon(true);
-				th.start();
-			}
-			countDownLatch.await();
-			long endStamp = System.currentTimeMillis();
-			logger.info("average qps : {}", (sendCount * thdNum * 1000L / (endStamp - startStampAll)));
+			th.setName("Input_thread_" + t);
+			th.setDaemon(true);
+			th.start();
 		}
 	}
 
@@ -166,7 +165,13 @@ public class SimpleClient {
 		int mod = groupCount % nodeCount;
 		int averageSize = ((mod > 0) && (index < mod)) ? groupCount / nodeCount + 1 : (groupCount <= nodeCount) ? 1 : groupCount / nodeCount;
 		int startIndex = ((mod > 0) && (index < mod)) ? index * averageSize : index * averageSize + mod;
+		// groupCount < nodeCount leaves the trailing nodes owning no group: startIndex then points
+		// past the last group and range comes out negative, so modulo yields a group that does not
+		// exist. Clamp to an empty range; getGroupIdxRand treats that as "this node drives nothing".
 		int range = Math.min(averageSize, groupCount - startIndex);
+		if (range < 0) {
+			range = 0;
+		}
 		int endIndex = (startIndex + range - 1) % groupCount + 1;
 		GroupRand groupRand = new GroupRand(startIndex, endIndex, range);
 		return groupRand;
