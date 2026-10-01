@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Maelstrom parses every line this process writes to stdout as a JSON message and
+  aborts the test on the first one that is not. WPaxos logs through log4j2, and
+  log4j2's default configuration writes to stdout, so without this file a single
+  log line would corrupt the protocol stream.
+
+  Everything therefore goes to stderr, which Maelstrom captures to the node's log
+  file, and the level is raised to WARN because a busy run produces a lot of it.
+-->
+<Configuration status="WARN">
+  <Appenders>
+    <Console name="stderr" target="SYSTEM_ERR">
+      <PatternLayout pattern="%d{HH:mm:ss.SSS} %-5level %logger{1} - %msg%n"/>
+    </Console>
+  </Appenders>
+  <Loggers>
+    <Root level="info">
+      <AppenderRef ref="stderr"/>
+    </Root>
+  </Loggers>
+</Configuration>

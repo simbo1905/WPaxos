@@ -1,0 +1,124 @@
+# syntax=docker/dockerfile:1
+#
+# Maelstrom harness for WPaxos.
+#
+# Two things live in this image that do not belong in the main WPaxos image:
+#
+#   * Leiningen and the Maelstrom engine itself. `lein run test` is how Maelstrom is
+#     driven, and it needs a Clojure/JVM toolchain plus a writable source tree for the
+#     submodule.
+#   * A JDK 17 runtime. Not a preference: the pinned Maelstrom project.clj declares
+#     Clojure 1.12 and Jepsen 0.3.7, whose transitive logback is compiled for class
+#     file version 55 (Java 11) and will not load on 8. WPaxos itself targets 1.8 and
+#     runs fine on 17, but its mmap page-cache layer reflects into `java.nio` and
+#     `jdk.internal.ref` internals that JPMS closes by default, so the node launcher
+#     below must open them. Both facts are load-bearing, hence the flags.
+#
+# The Maelstrom submodule is COPYed in rather than cloned, so the image is pinned to
+# exactly the commit the parent repository records in the submodule gitlink and cannot
+# drift.
+
+FROM eclipse-temurin:17-jdk
+
+# Leiningen 2.11.2, the version the Maelstrom project is built and tested against.
+ENV LEIN_VERSION=2.11.2
+ENV LEIN_HOME=/opt/lein
+ENV PATH=${LEIN_HOME}/bin:${PATH}
+
+# gnuplot is not required by the engine itself, but the pinned Maelstrom
+# project.clj and Jepsen's report generation reference it, and its absence makes
+# `lein run test` fail during setup rather than at the point of use.
+# Maven builds WPaxos itself; the temurin image ships only a JRE-ish JDK.
+ENV MAVEN_VERSION=3.9.9
+ENV MAVEN_HOME=/opt/maven
+ENV PATH=${MAVEN_HOME}/bin:${PATH}
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends gnuplot-nox ca-certificates curl git \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL -o /tmp/maven.tar.gz \
+      "https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" \
+ && mkdir -p ${MAVEN_HOME} \
+ && tar -xzf /tmp/maven.tar.gz -C ${MAVEN_HOME} --strip-components=1 \
+ && rm /tmp/maven.tar.gz \
+ && mvn -version
+
+RUN curl -fsSL -o /tmp/lein \
+      "https://raw.githubusercontent.com/technomancy/leiningen/${LEIN_VERSION}/bin/lein" \
+ && chmod +x /tmp/lein \
+ && mkdir -p ${LEIN_HOME}/bin \
+ && mv /tmp/lein ${LEIN_HOME}/bin/lein \
+ && lein version
+
+WORKDIR /wpaxos
+
+# Dependencies first, so a source-only change does not re-resolve the world.
+COPY pom.xml /wpaxos/pom.xml
+COPY core/pom.xml /wpaxos/core/pom.xml
+COPY sample/pom.xml /wpaxos/sample/pom.xml
+RUN mvn -B -q dependency:go-offline || true
+
+COPY core /wpaxos/core
+COPY sample /wpaxos/sample
+
+# The engine, at exactly the commit the submodule gitlink pins.
+COPY maelstrom /wpaxos/maelstrom
+
+# Resolve the engine's Clojure dependencies at build time. Jepsen and Maelstrom pull
+# in a large tree from Clojars; doing it here keeps the first `lein run test` from
+# spending minutes on downloads inside the test's own time budget.
+RUN cd /wpaxos/maelstrom && lein deps
+
+# Assemble the node's runtime classpath.
+#
+# `mvn package` cannot be used here. The parent pom binds maven-dependency-plugin 2.8
+# to the package phase, and 2.8 fails on Maven 3.9 with
+# "A required class was missing ... org/codehaus/plexus/archiver/ArchiverException",
+# so the jar-copy step never runs and target/dependency/ stays empty. Rather than edit
+# the shared pom (owned by another agent on this branch), invoke a current version of
+# the plugin directly and flatten every module's dependencies into one directory.
+RUN mvn -B -q -DskipTests -pl core,sample -am compile \
+ && mvn -B -q -pl core,sample -am \
+      org.apache.maven.plugins:maven-dependency-plugin:3.6.1:copy-dependencies \
+      -DoutputDirectory=/wpaxos/lib -DincludeScope=runtime -Dmdep.useRepositoryLayout=false \
+ && ls /wpaxos/lib | head -20
+
+# The node binary Maelstrom execs, with no arguments, speaking stdio JSON lines.
+#
+# The --add-opens flags are required, not cosmetic. WPaxOS's mmap page cache
+# (store/pagecache/MapedFile) reaches the DirectByteBuffer cleaner reflectively so it
+# can unmap eagerly; under JPMS that throws InaccessibleObjectException, the cleaner
+# thread dies, and every subsequent log write fails. Verified: without these flags a
+# node logs "Unable to make public java.lang.Object java.nio.DirectByteBuffer
+# .attachment() accessible" and then never commits.
+RUN printf '%s\n' \
+      '#!/bin/sh' \
+      'exec java \' \
+      '  --add-opens=java.base/java.nio=ALL-UNNAMED \' \
+      '  --add-opens=java.base/jdk.internal.ref=ALL-UNNAMED \' \
+      '  --add-exports=java.base/jdk.internal.ref=ALL-UNNAMED \' \
+      '  -cp "/wpaxos/core/target/classes:/wpaxos/sample/target/classes:/wpaxos/lib/*" \' \
+      '  -Dwpaxos.maelstrom.dataDir="${WPAXOS_MAELSTROM_DATA:-/tmp/wpaxos-maelstrom}" \' \
+      '  com.wuba.wpaxos.sample.maelstrom.MaelstromLinKV "$@"' \
+      > /usr/local/bin/wpaxos-maelstrom-node \
+ && chmod +x /usr/local/bin/wpaxos-maelstrom-node \
+ && cat /usr/local/bin/wpaxos-maelstrom-node
+
+COPY maelstrom-entrypoint.sh /usr/local/bin/maelstrom-entrypoint
+RUN chmod +x /usr/local/bin/maelstrom-entrypoint
+
+# Maelstrom runs every node as a separate process, so the store directory must be
+# writable by whoever runs the test. Node processes are given no arguments at all, so
+# they cannot be told where to put their physiclog; this default is the fallback, and
+# the entrypoint points it at a per-run directory.
+ENV WPAXOS_MAELSTROM_DATA=/tmp/wpaxos-maelstrom
+
+# Defaults matching the Maelstrom CLI, overridable per run.
+ENV NODES=5
+ENV TIME_LIMIT=180
+ENV RATE=20
+ENV INTERVAL=10
+ENV NEMESIS=partition,kill,pause
+
+ENTRYPOINT ["/usr/local/bin/maelstrom-entrypoint"]
