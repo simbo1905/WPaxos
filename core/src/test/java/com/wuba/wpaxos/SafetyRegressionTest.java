@@ -98,7 +98,6 @@ public class SafetyRegressionTest {
                     "a failed force must leave the bytes dirty so a later flush can retry",
                     0, flushedPosition);
         } finally {
-            mapedFile.destroy(0);
             file.delete();
             directory.delete();
         }
